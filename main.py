@@ -1,65 +1,118 @@
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from jose import jwt
-from datetime import datetime, timedelta
+from datetime   import datetime
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.orm import Session
+import models
+from database import SessionLocal, engine
 
-app = FastAPI(title="Secure-Duka: Enterprise Edition")
+# Step 1: Initialize the database tables
+models.Base.metadata.create_all(bind=engine)
 
-# --- SECURITY CONFIGURATION ---
-SECRET_KEY = "microsoft-adc-nairobi-2026" 
-ALGORITHM = "HS256"
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+app = FastAPI()
 
-# Mock User Data (Modeled after a Duka Owner)
-fake_users_db = {
-    "admin": {"username": "admin", "password": "securepassword123"}
-}
-
-# Your Functional Inventory Data (Populated)
-inventory  = [
-   {"item": "Maize Flour", "price": 120, "unit": "KES/kg"},
-   {"item": "White Rice", "price": 150, "unit": "KES/kg"},
-   {"item": "Cooking Oil", "price": 200, "unit": "KES/liter"},
-]
-
-def create_access_token(data: dict):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=30)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+# Step 2: Dependency to get the database session
+def get_db():
+    db = SessionLocal()
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid Credentials")
-        return username
-    except:
-        raise HTTPException(status_code=401, detail="Could not validate credentials")
+        yield db
+    finally:
+        db.close()
 
-# --- PROTECTED ENDPOINTS ---
+# Step 3: The "Recording a Sale" Logic (The Foundation for Analytics)
+@app.post("/sales/")
+def create_sale(product_id: int, quantity: int, db: Session = Depends(get_db)):
+    # 1. Fetch the product
+    product = db.query(models.Product).filter(models.Product.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
 
-@app.post("/token")
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = fake_users_db.get(form_data.username)
-    if not user or form_data.password!= user["password"]:
-        raise HTTPException(status_code=400, detail="Incorrect username or password")
+    # 2. Check stock
+    if product.stock < quantity:
+        raise HTTPException(status_code=400, detail="Not enough stock")
+
+    # 3. Update stock (Software Engineering)
+    product.stock -= quantity
+
+    # 4. Log the sale (Data Science Foundation)
+    new_sale = models.Sale(product_id=product_id, quantity_sold=quantity)
+    db.add(new_sale)
+    db.commit()
     
-    access_token = create_access_token(data={"sub": user["username"]})
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {"message": f"Sold {quantity} of {product.name}. Remaining: {product.stock}"}
+import pandas as pd # Make sure to 'pip install pandas'
 
-@app.get("/inventory")
-async def get_inventory(current_user: str = Depends(get_current_user)):
-    # Only logged-in users can see this now!
-    return inventory
+@app.get("/analytics/forecast/{product_id}")
+def get_inventory_forecast(product_id: int, db: Session = Depends(get_db)):
+    # 1. Get all sales for this product
+    sales = db.query(models.Sale).filter(models.Sale.product_id == product_id).all()
+    product = db.query(models.Product).filter(models.Product.id == product_id).first()
+    
+    if not sales:
+        return {"message": "Not enough sales data to predict yet."}
 
-@app.get("/predict-stockouts")
-async def predict_stockouts(current_user: str = Depends(get_current_user)):
-    # Data Science layer protected by the Security Shield
-    at_risk = [item for item in inventory if item["stock"] < 5]
+    # 2. Convert database data to a Pandas DataFrame (Data Science Step)
+    df = pd.DataFrame([{"date": s.sale_date, "qty": s.quantity_sold} for s in sales])
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # 3. Calculate Average Daily Sales
+    total_days = (df['date'].max() - df['date'].min()).days or 1
+    avg_daily_sales = df['qty'].sum() / total_days
+    
+    # 4. Predict Days Remaining
+    if avg_daily_sales == 0:
+        return {"message": "No daily sales recorded."}
+        
+    days_left = product.stock / avg_daily_sales
+    
     return {
-        "analysis": "Predictive Stock Alert",
-        "at_risk_items": at_risk,
-        "authorized_by": current_user
+        "product": product.name,
+        "current_stock": product.stock,
+        "avg_daily_velocity": round(avg_daily_sales, 2),
+        "estimated_days_remaining": round(days_left, 1)
     }
+    
+@app.get("/analytics/restock-report/")
+def get_restock_report(days_threshold: int = 3, db: Session = Depends(get_db)):
+    products = db.query(models.Product).all()
+    report = []
+
+    for product in products:
+        sales = db.query(models.Sale).filter(models.Sale.product_id == product.id).all()
+        
+        if len(sales) > 1: # We need at least 2 sales to find a "trend"
+            df = pd.DataFrame([{"date": s.sale_date, "qty": s.quantity_sold} for s in sales])
+            df['date'] = pd.to_datetime(df['date'])
+            
+            total_days = (df['date'].max() - df['date'].min()).days or 1
+            avg_daily_sales = df['qty'].sum() / total_days
+            
+            if avg_daily_sales > 0:
+                days_left = product.stock / avg_daily_sales
+                
+                # Only add to report if it's running out soon (e.g., within 3 days)
+                if days_left <= days_threshold:
+                    report.append({
+                        "product": product.name,
+                        "current_stock": product.stock,
+                        "days_remaining": round(days_left, 1),
+                        "status": "URGENT" if days_left <= 1 else "WARNING"
+                    })
+
+    return {
+        "report_generated_at": datetime.utcnow(),
+        "urgent_restocks": report,
+        "total_items_monitored": len(products)
+    }
+@app.get("/analytics/raw-sales/{product_id}")
+def get_raw_sales(product_id: int, db: Session = Depends(get_db)):
+    sales = db.query(models.Sale).filter(models.Sale.product_id == product_id).all()
+    return [{"date": s.sale_date.strftime("%Y-%m-%d"), "quantity": s.quantity_sold} for s in sales]
+@app.post("/products/restock/{product_id}")
+def restock_product(product_id: int, quantity: int, db: Session = Depends(get_db)):
+    product = db.query(models.Product).filter(models.Product.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    
+    product.stock += quantity
+    db.commit()
+    return {"message": f"Successfully added {quantity} units. New stock: {product.stock}"}
+    
